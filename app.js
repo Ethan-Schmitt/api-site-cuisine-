@@ -2,6 +2,9 @@ const express = require('express');
 const path = require('path');
 require('dotenv').config();
 
+// 1. AJOUT : On a besoin de la BDD ici pour la route goals
+const db = require('better-sqlite3')('./database/recettes.db'); 
+
 const app = express();
 
 // Import routes
@@ -17,7 +20,7 @@ const errorHandler = require('./middleware/errorHandler');
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// CORS middleware (if needed for frontend testing)
+// CORS middleware
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -36,11 +39,32 @@ app.use((req, res, next) => {
     next();
 });
 
-// Routes
+// Routes existantes
 app.use('/api/recipes', recipeRoutes);
 app.use('/api/cuisines', cuisineRoutes);
 app.use('/api/ingredients', ingredientRoutes);
 app.use('/api/users', userRoutes);
+
+// ---------------------------------------------------------
+// 2. AJOUT : LA ROUTE POUR LES OBJECTIFS (GOALS)
+// ---------------------------------------------------------
+app.get('/api/goals', (req, res) => {
+    try {
+        const stmt = db.prepare('SELECT * FROM Goals');
+        const goals = stmt.all();
+        res.json({ 
+            success: true, 
+            data: goals 
+        });
+    } catch (error) {
+        console.error("Erreur Goals:", error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+// ---------------------------------------------------------
 
 // Home route
 app.get('/', (req, res) => {
@@ -53,7 +77,8 @@ app.get('/', (req, res) => {
             recipes: '/api/recipes',
             cuisines: '/api/cuisines',
             ingredients: '/api/ingredients',
-            users: '/api/users'
+            users: '/api/users',
+            goals: '/api/goals' // Ajouté à la doc
         },
         documentation: {
             postman: 'Import the Postman collection to test all endpoints',
@@ -71,6 +96,7 @@ app.get('/help', (req, res) => {
             'GET /': 'API information and available endpoints',
             'GET /help': 'This help page',
             'GET /api/recipes': 'Get all recipes',
+            'GET /api/goals': 'Get all dietary goals', // Ajouté à la doc
             'GET /api/recipes/:id': 'Get recipe by ID',
             'POST /api/recipes': 'Create new recipe (requires auth)',
             'PUT /api/recipes/:id': 'Update recipe (requires auth)',
@@ -102,6 +128,7 @@ app.use('*', (req, res) => {
             'GET /api/recipes',
             'GET /api/cuisines',
             'GET /api/ingredients',
+            'GET /api/goals',
             'POST /api/users/register',
             'POST /api/users/login'
         ]
