@@ -63,20 +63,26 @@ const sql = {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `,
 
-    // --- REQUÊTES POUR LA LOGIQUE COMPLEXE ---
     findIngredientByName: 'SELECT ingredient_id FROM Ingredients WHERE name = ?',
     createIngredient: 'INSERT INTO Ingredients (name, unit) VALUES (?, ?)',
     linkIngredientToRecipe: 'INSERT INTO RecipeIngredients (recipe_id, ingredient_id, quantity) VALUES (?, ?, ?)',
-    
-    // CORRECTION ICI : On ajoute ingredient_id dans la requête car ta table le demande
     addInstructionStep: 'INSERT INTO RecipeInstructions (recipe_id, step_number, description, ingredient_id) VALUES (?, ?, ?, ?)',
 
-    // --- MODIFICATION / SUPPRESSION ---
+    // --- MODIFICATION ---
     addIngredient: 'INSERT INTO RecipeIngredients (recipe_id, ingredient_id, quantity) VALUES (?, ?, ?)',
     updateTitle: 'UPDATE Recipes SET title = ? WHERE recipe_id = ?',
     updateAllergy: 'UPDATE Recipes SET AllergiesInformation_id = ? WHERE recipe_id = ?',
     updateInstruction: 'UPDATE RecipeInstructions SET description = ? WHERE instruction_id = ? AND recipe_id = ?',
+    
+    // --- SUPPRESSION & NETTOYAGE ---
+    deleteRecipeIngredients: 'DELETE FROM RecipeIngredients WHERE recipe_id = ?',
+    deleteRecipeInstructions: 'DELETE FROM RecipeInstructions WHERE recipe_id = ?',
+    deleteRecipeRatings: 'DELETE FROM RecipeRatings WHERE recipe_id = ?',
     deleteRecipe: 'DELETE FROM Recipes WHERE recipe_id = ?',
+    
+    // ✨ MAGIE : Supprime les ingrédients qui ne sont liés à AUCUNE recette
+    deleteUnusedIngredients: 'DELETE FROM Ingredients WHERE ingredient_id NOT IN (SELECT ingredient_id FROM RecipeIngredients)',
+    
     removeIngredient: 'DELETE FROM RecipeIngredients WHERE recipe_id = ? AND ingredient_id = ?',
     checkOwnership: 'SELECT user_id FROM Recipes WHERE recipe_id = ?'
 };
@@ -89,7 +95,7 @@ const runQuery = (query, params) => {
     return new Promise((resolve, reject) => {
         database.run(query, params, function(err) {
             if (err) reject(err);
-            else resolve(this); // 'this' contient lastID
+            else resolve(this); // 'this' contient lastID et changes
         });
     });
 };
@@ -104,13 +110,10 @@ const getQuery = (query, params) => {
 };
 
 // ============================================
-// 3. ROUTE DE CRÉATION (CORRIGÉE)
+// 3. ROUTES RECETTES
 // ============================================
 
-/**
- * Create a new recipe
- * POST /api/recipes
- */
+// CRÉATION
 router.post('/', authenticate, async (req, res) => {
     let { title, description, image_url, cuisine_id, goal_id, DietaryInformation_id, AllergiesInformation_id, ingredients, instructions } = req.body;
     const userId = req.user.user_id;
@@ -120,18 +123,15 @@ router.post('/', authenticate, async (req, res) => {
     }
 
     try {
-        // A. Créer la recette
         const result = await runQuery(sql.create, [
             title, description, image_url, cuisine_id, goal_id, DietaryInformation_id, AllergiesInformation_id, userId
         ]);
         const newRecipeId = result.lastID;
-        console.log(`✅ Recette créée ID: ${newRecipeId}`);
 
-        // B. Gérer les Ingrédients
+        // Ingrédients
         if (ingredients && Array.isArray(ingredients)) {
             for (const ing of ingredients) {
                 if (!ing.name) continue;
-
                 let ingId;
                 const existingIng = await getQuery(sql.findIngredientByName, [ing.name]);
 
@@ -141,35 +141,26 @@ router.post('/', authenticate, async (req, res) => {
                     const createResult = await runQuery(sql.createIngredient, [ing.name, ing.unit || '']);
                     ingId = createResult.lastID;
                 }
-
                 await runQuery(sql.linkIngredientToRecipe, [newRecipeId, ingId, Number(ing.quantity) || 0]);
             }
         }
 
-        // C. Gérer les Instructions (CORRECTION ICI)
-        
-        // 1. Conversion automatique si c'est du texte brut (au cas où le front envoie du texte)
+        // Instructions (Gestion String ou Array)
         if (typeof instructions === 'string') {
-            console.log("⚠️ Instructions reçues en texte, conversion en tableau...");
             instructions = instructions.split('\n').filter(line => line.trim() !== '');
         }
 
-        // 2. Enregistrement des étapes
         if (instructions && Array.isArray(instructions)) {
             for (let i = 0; i < instructions.length; i++) {
                 const inst = instructions[i];
-                
-                // On gère les formats : objet {description: "..."} ou string "..."
                 const stepNum = inst.step_number || (i + 1);
                 const desc = inst.description || inst; 
 
                 if (desc && typeof desc === 'string' && desc.trim().length > 0) {
-                    // CORRECTION CRITIQUE : On passe 'null' pour le 4ème paramètre (ingredient_id)
-                    // car ta table l'attend, même s'il est vide pour l'instant.
+                    // On met NULL pour ingredient_id car le frontend ne l'envoie pas encore
                     await runQuery(sql.addInstructionStep, [newRecipeId, stepNum, desc.trim(), null]);
                 }
             }
-            console.log(`✅ ${instructions.length} instructions enregistrées.`);
         }
 
         res.status(201).json({
@@ -183,10 +174,6 @@ router.post('/', authenticate, async (req, res) => {
         res.status(500).json({ success: false, message: 'Failed to create recipe', error: err.message });
     }
 });
-
-// ============================================
-// 4. AUTRES ROUTES (Standard)
-// ============================================
 
 // GET ALL
 router.get('/', (req, res) => {
@@ -274,15 +261,38 @@ router.put('/:id/instructions/:stepId', authenticate, checkRecipeOwnership, (req
     });
 });
 
-// DELETE
-router.delete('/:id', authenticate, checkRecipeOwnership, (req, res) => {
-    database.run(sql.deleteRecipe, [req.params.id], function(err) {
-        if (err) return res.status(500).json({ success: false, error: err.message });
-        res.status(200).json({ success: true, message: 'Recipe deleted' });
-    });
+// ============================================
+// SUPPRESSION AUTOMATISÉE ET NETTOYAGE
+// ============================================
+router.delete('/:id', authenticate, checkRecipeOwnership, async (req, res) => {
+    const id = req.params.id;
+
+    try {
+        // 1. Supprimer les liens Ingrédients de CETTE recette
+        await runQuery(sql.deleteRecipeIngredients, [id]);
+        
+        // 2. Supprimer les Instructions de CETTE recette
+        await runQuery(sql.deleteRecipeInstructions, [id]);
+        
+        // 3. Supprimer les Notes/Avis de CETTE recette
+        await runQuery(sql.deleteRecipeRatings, [id]);
+        
+        // 4. Supprimer la Recette elle-même
+        await runQuery(sql.deleteRecipe, [id]);
+
+        // 5. NETTOYAGE GLOBAL : Supprimer les ingrédients qui ne servent plus à personne
+        // On ne passe pas d'ID ici, c'est un scan global
+        await runQuery(sql.deleteUnusedIngredients, []);
+
+        res.status(200).json({ success: true, message: 'Recette supprimée et base de données nettoyée.' });
+
+    } catch (err) {
+        console.error("Erreur suppression:", err);
+        res.status(500).json({ success: false, message: 'Erreur lors de la suppression', error: err.message });
+    }
 });
 
-// INGREDIENTS ROUTES
+// INGREDIENTS ROUTES (Ajout/Suppression unitaire)
 router.post('/:id/ingredients', authenticate, (req, res) => {
     const { ingredient_id, quantity } = req.body;
     if (!ingredient_id || !quantity) return res.status(400).json({ success: false, message: 'Missing data' });
